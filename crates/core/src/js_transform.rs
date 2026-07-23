@@ -103,16 +103,23 @@ struct ChildProcess {
 /// JSON array line on stdout. The process is kept alive across batches.
 ///
 /// If a batch times out (default 30s), the child is killed and respawned.
+///
+/// Holds one transform subprocess per lane (fixed at 4 children).
+/// Events are partitioned by [`DocumentId`] so same-id edits stay on one
+/// child (ordered) while distinct ids can run on different children in parallel.
 pub struct JsTransformer {
     script_path: PathBuf,
     id_type: IdType,
     /// When set, reindexes WAL tuple columns to match the generated schema order.
     column_reindex: Option<Vec<usize>>,
     timeout: Duration,
-    process: Mutex<Option<ChildProcess>>,
+    /// One mutexed child per lane. Lane `i` always uses `processes[i]`.
+    processes: Vec<Mutex<Option<ChildProcess>>>,
 }
 
 impl JsTransformer {
+    const LANES: usize = 4;
+
     pub fn new(script_path: PathBuf, id_type: IdType) -> Self {
         Self::new_with_timeout(script_path, id_type, DEFAULT_TIMEOUT)
     }
@@ -123,7 +130,7 @@ impl JsTransformer {
             id_type,
             column_reindex: None,
             timeout,
-            process: Mutex::new(None),
+            processes: (0..Self::LANES).map(|_| Mutex::new(None)).collect(),
         }
     }
 
@@ -147,8 +154,12 @@ impl JsTransformer {
             id_type,
             column_reindex: Some(column_reindex),
             timeout,
-            process: Mutex::new(None),
+            processes: (0..Self::LANES).map(|_| Mutex::new(None)).collect(),
         }
+    }
+
+    pub fn concurrency(&self) -> usize {
+        self.processes.len()
     }
 
     fn spawn_child(&self) -> Result<ChildProcess, CoreError> {
@@ -217,18 +228,18 @@ impl JsTransformer {
         })
     }
 
-    /// Get or spawn the child process.
-    async fn ensure_process(&self) -> Result<(), CoreError> {
-        let mut guard = self.process.lock().await;
+    /// Get or spawn the child process for a lane.
+    async fn ensure_process(&self, lane: usize) -> Result<(), CoreError> {
+        let mut guard = self.processes[lane].lock().await;
         if guard.is_none() {
             *guard = Some(self.spawn_child()?);
         }
         Ok(())
     }
 
-    /// Kill the current child and spawn a fresh one.
-    async fn respawn(&self) -> Result<(), CoreError> {
-        let mut guard = self.process.lock().await;
+    /// Kill the child for a lane and spawn a fresh one.
+    async fn respawn(&self, lane: usize) -> Result<(), CoreError> {
+        let mut guard = self.processes[lane].lock().await;
         if let Some(mut proc) = guard.take() {
             let _ = proc.child.kill().await;
         }
@@ -305,24 +316,24 @@ impl JsTransformer {
     /// and the **same batch is retried once** on the fresh process. Timeouts
     /// are not retried because they likely indicate a problem with the script
     /// itself rather than a transient child crash.
-    async fn send_batch_to_process(&self, input: &str) -> Result<String, CoreError> {
-        self.ensure_process().await?;
+    async fn send_batch_to_process(&self, lane: usize, input: &str) -> Result<String, CoreError> {
+        self.ensure_process(lane).await?;
 
-        let result = self.try_send(input).await;
+        let result = self.try_send(lane, input).await;
 
         match result {
             Ok(Ok(line)) => Ok(line),
             Ok(Err(_)) => {
                 // Process error — respawn and retry this batch once
-                self.respawn().await?;
-                match self.try_send(input).await {
+                self.respawn(lane).await?;
+                match self.try_send(lane, input).await {
                     Ok(Ok(line)) => Ok(line),
                     Ok(Err(e)) => {
-                        self.respawn().await?;
+                        self.respawn(lane).await?;
                         Err(e)
                     }
                     Err(_) => {
-                        self.respawn().await?;
+                        self.respawn(lane).await?;
                         Err(CoreError::pipeline(format!(
                             "transform timed out after {}s",
                             self.timeout.as_secs()
@@ -332,7 +343,7 @@ impl JsTransformer {
             }
             Err(_) => {
                 // Timeout — kill and respawn but don't retry
-                self.respawn().await?;
+                self.respawn(lane).await?;
                 Err(CoreError::pipeline(format!(
                     "transform timed out after {}s",
                     self.timeout.as_secs()
@@ -341,13 +352,16 @@ impl JsTransformer {
         }
     }
 
-    /// Attempt a single send/receive cycle on the current child process.
+    /// Attempt a single send/receive cycle on the child for `lane`.
     async fn try_send(
         &self,
+        lane: usize,
         input: &str,
     ) -> Result<Result<String, CoreError>, tokio::time::error::Elapsed> {
-        let mut guard = self.process.lock().await;
-        let proc = guard.as_mut().expect("process should exist after ensure");
+        let mut guard = self.processes[lane].lock().await;
+        let proc = guard
+            .as_mut()
+            .expect("process should exist after ensure");
 
         let fut = async {
             // Write JSON array + newline
@@ -414,13 +428,53 @@ impl JsTransformer {
 
         tokio::time::timeout(self.timeout, fut).await
     }
+
+    /// Partition events by document id into lanes, preserving arrival order
+    /// within each lane. Each item is `(original_index, event, id)`. Empty
+    /// lanes are omitted from the result.
+    fn partition_lanes<'a>(
+        &self,
+        events: &'a [(&'a RowEvent, DocumentId)],
+    ) -> Vec<(usize, Vec<(usize, &'a RowEvent, DocumentId)>)> {
+        let n = self.concurrency();
+        let mut lanes: Vec<Vec<(usize, &RowEvent, DocumentId)>> =
+            (0..n).map(|_| Vec::new()).collect();
+        for (idx, &(event, ref id)) in events.iter().enumerate() {
+            lanes[id.lane(n)].push((idx, event, id.clone()));
+        }
+        lanes
+            .into_iter()
+            .enumerate()
+            .filter(|(_, evs)| !evs.is_empty())
+            .collect()
+    }
+
+    async fn transform_lane(
+        &self,
+        lane: usize,
+        events: &[(&RowEvent, DocumentId)],
+    ) -> Result<Vec<Action>, CoreError> {
+        let input = self.serialize_events(events)?;
+        let output = self.send_batch_to_process(lane, &input).await?;
+        match self.parse_actions(output.trim()) {
+            Ok(actions) => Ok(actions),
+            Err(e) => {
+                // Parse failure may mean the child emitted extra/malformed
+                // output. Respawn to realign the request/response framing.
+                self.respawn(lane).await?;
+                Err(e)
+            }
+        }
+    }
 }
 
 impl Drop for JsTransformer {
     fn drop(&mut self) {
         // Best-effort kill. We can't await here, so just start the kill.
-        if let Some(mut proc) = self.process.get_mut().take() {
-            let _ = proc.child.start_kill();
+        for slot in &mut self.processes {
+            if let Some(mut proc) = slot.get_mut().take() {
+                let _ = proc.child.start_kill();
+            }
         }
     }
 }
@@ -431,17 +485,53 @@ impl Transformer for JsTransformer {
         events: &'a [(&'a RowEvent, DocumentId)],
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Action>, CoreError>> + Send + 'a>> {
         Box::pin(async move {
-            let input = self.serialize_events(events)?;
-            let output = self.send_batch_to_process(&input).await?;
-            match self.parse_actions(output.trim()) {
-                Ok(actions) => Ok(actions),
-                Err(e) => {
-                    // Parse failure may mean the child emitted extra/malformed
-                    // output. Respawn to realign the request/response framing.
-                    self.respawn().await?;
-                    Err(e)
+            if events.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let partitions = self.partition_lanes(events);
+            // One non-empty partition: use that lane alone (skip join overhead;
+            // common for tiny OLTP transactions).
+            if partitions.len() == 1 {
+                let (lane, lane_events) = &partitions[0];
+                let bare: Vec<(&RowEvent, DocumentId)> = lane_events
+                    .iter()
+                    .map(|(_, event, id)| (*event, id.clone()))
+                    .collect();
+                return self.transform_lane(*lane, &bare).await;
+            }
+
+            let futs = partitions.iter().map(|(lane, lane_events)| async {
+                let bare: Vec<(&RowEvent, DocumentId)> = lane_events
+                    .iter()
+                    .map(|(_, event, id)| (*event, id.clone()))
+                    .collect();
+                self.transform_lane(*lane, &bare).await
+            });
+            // Finish every lane before returning (batch latency follows the
+            // slowest lane; a failure must not cancel another mid round trip).
+            let lane_results = futures::future::join_all(futs).await;
+            let mut actions = Vec::new();
+            let mut first_err = None;
+            for result in lane_results {
+                match result {
+                    Ok(lane_actions) => actions.extend(lane_actions),
+                    Err(e) if first_err.is_none() => first_err = Some(e),
+                    Err(_) => {}
                 }
             }
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+            // Concatenating lanes without restoring WAL order is correct under puffgres's
+            // delivery model: writes are keyed by document id and a document is owned by
+            // exactly one source id, so any two actions touching the same document share a
+            // source id, hence the same lane, hence stay in arrival order. Cross-lane order
+            // is irrelevant (disjoint documents). The only ordering the mirror requires is
+            // "never reorder two events on the same id", which lanes preserve. A transform
+            // that maps distinct source rows onto one shared document violates the
+            // upsert-shaped/idempotent contract and is unsupported.
+            Ok(actions)
         })
     }
 }
@@ -652,6 +742,50 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["operation"], "insert");
         assert_eq!(parsed[1]["operation"], "update");
+    }
+
+    #[test]
+    fn partition_lanes_keeps_same_id_together_in_order() {
+        let t = JsTransformer::new_with_timeout(
+            PathBuf::from("t.ts"),
+            IdType::Uint,
+            DEFAULT_TIMEOUT,
+        );
+        let e1 = make_event(Operation::Insert, vec!["a"]);
+        let e2 = make_event(Operation::Update, vec!["b"]);
+        let e3 = make_event(Operation::Update, vec!["c"]);
+        let events = [
+            (&e1, DocumentId::Uint(42)),
+            (&e2, DocumentId::Uint(99)),
+            (&e3, DocumentId::Uint(42)),
+        ];
+
+        let partitions = t.partition_lanes(&events);
+        let lane_42 = DocumentId::Uint(42).lane(4);
+        let lane_99 = DocumentId::Uint(99).lane(4);
+
+        let part_42 = partitions
+            .iter()
+            .find(|(lane, _)| *lane == lane_42)
+            .expect("lane for id 42");
+        assert_eq!(part_42.1.len(), 2);
+        assert_eq!(part_42.1[0].0, 0); // original batch index
+        assert_eq!(part_42.1[1].0, 2);
+        assert_eq!(part_42.1[0].2, DocumentId::Uint(42));
+        assert_eq!(part_42.1[1].2, DocumentId::Uint(42));
+        // Arrival order within the lane: insert then update.
+        assert_eq!(part_42.1[0].1.operation, Operation::Insert);
+        assert_eq!(part_42.1[1].1.operation, Operation::Update);
+
+        if lane_42 != lane_99 {
+            let part_99 = partitions
+                .iter()
+                .find(|(lane, _)| *lane == lane_99)
+                .expect("lane for id 99");
+            assert_eq!(part_99.1.len(), 1);
+            assert_eq!(part_99.1[0].0, 1);
+            assert_eq!(part_99.1[0].2, DocumentId::Uint(99));
+        }
     }
 
     #[test]
@@ -874,5 +1008,100 @@ mod tests {
             }
             _ => panic!("expected Upsert"),
         }
+    }
+
+    /// Real tsx fan-out transform across multiple lanes: every emitted document
+    /// is written to the namespace sink, and the transform error path (what
+    /// feeds the DLQ) stays empty.
+    #[tokio::test]
+    #[ignore = "spawns a real pnpx tsx subprocess; run with --ignored"]
+    async fn fanout_multi_lane_lands_all_docs_and_dlq_empty() {
+        use std::collections::HashSet;
+
+        use crate::BackfillSink;
+        use crate::test_sink::MetricsSink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("fanout_transform.ts");
+        std::fs::write(
+            &script_path,
+            r#"
+import { createInterface } from "readline";
+const rl = createInterface({ input: process.stdin });
+void (async () => {
+  for await (const line of rl) {
+    const input = JSON.parse(line);
+    const output = [];
+    for (const event of input) {
+      if (event.operation === "delete") {
+        output.push({ type: "delete", id: event.id });
+        continue;
+      }
+      output.push({ type: "upsert", id: event.id * 1000 + 1, document: { part: 1, src: event.id } });
+      output.push({ type: "upsert", id: event.id * 1000 + 2, document: { part: 2, src: event.id } });
+    }
+    process.stdout.write(JSON.stringify(output) + "\n");
+  }
+})();
+"#,
+        )
+        .unwrap();
+
+        let transformer = JsTransformer::new(script_path, IdType::Uint);
+
+        let mut source_ids = Vec::new();
+        let mut lanes = HashSet::new();
+        for i in 0..500u64 {
+            let id = DocumentId::Uint(i);
+            lanes.insert(id.lane(transformer.concurrency()));
+            source_ids.push(i);
+            if lanes.len() == transformer.concurrency() && source_ids.len() >= 32 {
+                break;
+            }
+        }
+        assert_eq!(lanes.len(), transformer.concurrency(), "batch must span all transform lanes");
+
+        let events: Vec<RowEvent> = source_ids
+            .iter()
+            .map(|&i| make_event(Operation::Insert, vec![&i.to_string()]))
+            .collect();
+        let batch: Vec<(&RowEvent, DocumentId)> = events
+            .iter()
+            .zip(source_ids.iter().copied())
+            .map(|(event, i)| (event, DocumentId::Uint(i)))
+            .collect();
+
+        let namespace = "fanout_ns";
+        let sink = MetricsSink::new();
+        let mut dlq: Vec<String> = Vec::new();
+
+        match transformer.transform_batch(&batch).await {
+            Ok(actions) => {
+                sink.write(namespace, &actions).await.unwrap();
+            }
+            Err(e) => {
+                dlq.push(e.to_string());
+            }
+        }
+
+        assert!(dlq.is_empty(), "transform failures would dead-letter; dlq={dlq:?}");
+
+        let expected: HashSet<DocumentId> = source_ids
+            .iter()
+            .flat_map(|&i| [DocumentId::Uint(i * 1000 + 1), DocumentId::Uint(i * 1000 + 2)])
+            .collect();
+
+        let written: HashSet<DocumentId> = sink
+            .writes_for(namespace)
+            .into_iter()
+            .flat_map(|w| w.actions)
+            .filter_map(|a| match a {
+                Action::Upsert { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(written, expected, "every fan-out document must land in the namespace");
+        assert_eq!(written.len(), source_ids.len() * 2);
     }
 }
