@@ -2424,6 +2424,7 @@ dependencies = [
  "dialoguer",
  "dotenvy",
  "fake",
+ "futures",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",

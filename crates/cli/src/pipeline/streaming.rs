@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use futures::stream::{self, StreamExt};
 use puff::TurbopufferClient;
-use puffgres_core::{DocumentId, Router, Transformer};
+use puffgres_core::{BackfillSink, DocumentId, Router, Transformer};
 use replication::{RelationCache, ReplicationStream, ReplicationStreamConfig, RowEvent};
 use state::{Store, StreamingCheckpoint};
 use tokio_util::sync::CancellationToken;
@@ -29,49 +30,77 @@ fn should_skip_config(
 
 /// Route, transform, and send a set of events to Turbopuffer. Shared between
 /// committed batches and streaming sub-batches.
+///
+/// Configs are independent namespaces, so up to `concurrency` of them run at
+/// once. Each config still transforms and sends serially on its own child.
+/// Caller must not ack until this returns (all in-flight configs finished).
 async fn process_events(
     events: &[RowEvent],
     relation_cache: &RelationCache,
     router: &Router,
     transformers: &HashMap<String, Box<dyn Transformer>>,
     namespaces: &HashMap<String, String>,
-    puff_client: &TurbopufferClient,
+    sink: &dyn BackfillSink,
     db: &Store,
     metrics: Option<&Metrics>,
     events_processed: &mut HashMap<String, u64>,
     dlq_lsn: u64,
     config_checkpoint_lsns: &HashMap<String, u64>,
     batch_lsn: u64,
+    concurrency: usize,
 ) -> Result<(), CliError> {
     let config_events = router.route_batch(events, relation_cache);
+    let concurrency = concurrency.max(1);
 
-    for (config_name, events) in &config_events {
-        if should_skip_config(config_name, batch_lsn, config_checkpoint_lsns) {
-            continue;
+    let jobs: Vec<_> = config_events
+        .iter()
+        .filter(|(config_name, _)| {
+            !should_skip_config(config_name, batch_lsn, config_checkpoint_lsns)
+        })
+        .map(|(config_name, events)| {
+            let before = events_processed.get(*config_name).copied().unwrap_or(0);
+            (*config_name, events.as_slice(), before)
+        })
+        .collect();
+
+    let results = stream::iter(jobs)
+        .map(|(config_name, events, events_processed_before)| async move {
+            let transformer = transformers.get(config_name).ok_or_else(|| {
+                CliError::Run(format!(
+                    "internal error: no transformer for config '{config_name}'"
+                ))
+            })?;
+            let namespace = namespaces.get(config_name).ok_or_else(|| {
+                CliError::Run(format!(
+                    "internal error: no namespace for config '{config_name}'"
+                ))
+            })?;
+
+            let processed = process_config_events(
+                config_name,
+                events,
+                namespace,
+                transformer.as_ref(),
+                sink,
+                db,
+                metrics,
+                events_processed_before,
+                dlq_lsn,
+            )
+            .await?;
+            Ok::<_, CliError>((config_name.to_string(), processed))
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+    // Barrier: fold counts only after every config finished. Propagate first Err
+    // so the caller does not ack an incomplete batch.
+    for result in results {
+        let (config_name, processed) = result?;
+        if processed > 0 {
+            *events_processed.entry(config_name).or_insert(0) += processed;
         }
-        let transformer = transformers.get(*config_name).ok_or_else(|| {
-            CliError::Run(format!(
-                "internal error: no transformer for config '{config_name}'"
-            ))
-        })?;
-        let namespace = namespaces.get(*config_name).ok_or_else(|| {
-            CliError::Run(format!(
-                "internal error: no namespace for config '{config_name}'"
-            ))
-        })?;
-
-        process_config_events(
-            config_name,
-            events,
-            namespace,
-            transformer.as_ref(),
-            puff_client,
-            db,
-            metrics,
-            events_processed,
-            dlq_lsn,
-        )
-        .await?;
     }
     Ok(())
 }
@@ -81,12 +110,12 @@ async fn process_config_events(
     events: &[(&RowEvent, DocumentId)],
     namespace: &str,
     transformer: &dyn Transformer,
-    puff_client: &TurbopufferClient,
+    sink: &dyn BackfillSink,
     db: &Store,
     metrics: Option<&Metrics>,
-    events_processed: &mut HashMap<String, u64>,
+    events_processed_before: u64,
     dlq_lsn: u64,
-) -> Result<(), CliError> {
+) -> Result<u64, CliError> {
     let transform_result = transformer.transform_batch(events).await;
 
     match transform_result {
@@ -96,10 +125,11 @@ async fn process_config_events(
                 m.cdc_events_failed.add(events.len() as u64, &[]);
             }
             send_events_to_dlq(db, config_name, dlq_lsn, events, &e.to_string(), false).await?;
+            Ok(0)
         }
         Ok(actions) => {
             let send_start = std::time::Instant::now();
-            match puff_client.send_batch(namespace, &actions).await {
+            match sink.write(namespace, &actions).await {
                 Err(e) => {
                     tracing::error!(config = %config_name, error = %e, "turbopuffer error, sending to DLQ");
                     if let Some(m) = metrics {
@@ -110,13 +140,14 @@ async fn process_config_events(
                     }
                     send_events_to_dlq(db, config_name, dlq_lsn, events, &e.to_string(), false)
                         .await?;
+                    Ok(0)
                 }
                 Ok(()) => {
-                    let count = events_processed.entry(config_name.to_string()).or_insert(0);
-                    *count += events.len() as u64;
+                    let processed = events.len() as u64;
+                    let total = events_processed_before + processed;
 
                     if let Some(m) = metrics {
-                        m.cdc_events_processed.add(events.len() as u64, &[]);
+                        m.cdc_events_processed.add(processed, &[]);
                         m.turbopuffer_requests.add(1, &[]);
                         m.turbopuffer_latency
                             .record(send_start.elapsed().as_millis() as f64, &[]);
@@ -126,14 +157,14 @@ async fn process_config_events(
                         config = %config_name,
                         namespace = %namespace,
                         events = events.len(),
-                        total = *count,
+                        total,
                         "batch sent",
                     );
+                    Ok(processed)
                 }
             }
         }
     }
-    Ok(())
 }
 
 /// Outer loop: reconnects the replication stream on schema changes.
@@ -155,7 +186,7 @@ pub(crate) async fn run_streaming_loop(
 ) -> Result<(), CliError> {
     let mut events_processed: HashMap<String, u64> = HashMap::new();
     let mut config_checkpoint_lsns: HashMap<String, u64> = HashMap::new();
-    // Build watched columns map: schema.table → columns referenced by any config.
+    // Build watched columns map: schema.table to columns referenced by any config.
     // Schema changes that only touch columns outside this set are silently accepted.
     // Tables where ANY config has columns = None get no entry, so all changes are breaking.
     let mut watched_columns: HashMap<String, Vec<String>> = HashMap::new();
@@ -366,6 +397,7 @@ pub(crate) async fn run_streaming_loop(
                         0, // no ack_lsn for sub-batches
                         &no_checkpoints,
                         0,
+                        project_config.config_concurrency(),
                     )
                     .await?;
                     continue;
@@ -438,6 +470,7 @@ pub(crate) async fn run_streaming_loop(
                     batch.ack_lsn,
                     &config_checkpoint_lsns,
                     batch.ack_lsn,
+                    project_config.config_concurrency(),
                 )
                 .await?;
             }
@@ -541,6 +574,21 @@ pub(crate) async fn run_streaming_loop(
 mod tests {
     use super::*;
 
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use config::IdType;
+    use puffgres_core::{Action, CoreError, Mapping, PassthroughTransformer};
+    use replication::{
+        ColumnInfo, ColumnValue, Operation, RelationInfo, ReplicaIdentity, TupleData,
+    };
+    use serde_json::json;
+    use state::{ConfigRecord, Store};
+
+    use crate::test_utils::SharedTestPg;
+
     #[test]
     fn should_skip_when_batch_lsn_below_checkpoint() {
         let mut checkpoints = HashMap::new();
@@ -581,4 +629,337 @@ mod tests {
         assert!(should_skip_config("old_config", batch_lsn, &checkpoints));
         assert!(!should_skip_config("new_config", batch_lsn, &checkpoints));
     }
+
+    /// Records write(namespace, actions) calls for predictability assertions.
+    struct CollectingSink {
+        writes: Mutex<Vec<(String, Vec<Action>)>>,
+    }
+
+    impl CollectingSink {
+        fn new() -> Self {
+            Self {
+                writes: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn actions_for(&self, namespace: &str) -> Vec<Action> {
+            self.writes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(ns, _)| ns == namespace)
+                .flat_map(|(_, actions)| actions.clone())
+                .collect()
+        }
+
+        fn fingerprints_for(&self, namespace: &str) -> Vec<String> {
+            self.actions_for(namespace)
+                .iter()
+                .map(|a| format!("{a:?}"))
+                .collect()
+        }
+    }
+
+    impl BackfillSink for CollectingSink {
+        fn write<'a>(
+            &'a self,
+            namespace: &'a str,
+            actions: &'a [Action],
+        ) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.writes
+                    .lock()
+                    .unwrap()
+                    .push((namespace.to_string(), actions.to_vec()));
+                Ok(())
+            })
+        }
+    }
+
+    struct FanoutTransformer {
+        chunks: u64,
+    }
+
+    impl Transformer for FanoutTransformer {
+        fn transform_batch<'a>(
+            &'a self,
+            events: &'a [(&'a RowEvent, DocumentId)],
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Action>, CoreError>> + Send + 'a>> {
+            let chunks = self.chunks;
+            Box::pin(async move {
+                let mut out = Vec::new();
+                for (_, id) in events {
+                    let DocumentId::Uint(base) = id else {
+                        return Err(CoreError::pipeline("fanout test expects uint ids"));
+                    };
+                    for i in 0..chunks {
+                        out.push(Action::Upsert {
+                            id: DocumentId::Uint(base * 1000 + i),
+                            document: json!({ "chunk": i }),
+                            vector: None,
+                            distance_metric: None,
+                            schema: None,
+                        });
+                    }
+                }
+                Ok(out)
+            })
+        }
+    }
+
+    struct FailingTransformer;
+
+    impl Transformer for FailingTransformer {
+        fn transform_batch<'a>(
+            &'a self,
+            _events: &'a [(&'a RowEvent, DocumentId)],
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<Action>, CoreError>> + Send + 'a>> {
+            Box::pin(async {
+                Err(CoreError::pipeline("injected transform failure"))
+            })
+        }
+    }
+
+    fn make_relation() -> RelationInfo {
+        RelationInfo {
+            id: 1,
+            namespace: "public".to_string(),
+            name: "pages".to_string(),
+            replica_identity: ReplicaIdentity::Default,
+            columns: vec![ColumnInfo {
+                part_of_key: true,
+                name: "id".to_string(),
+                type_oid: 23,
+                type_modifier: -1,
+            }],
+        }
+    }
+
+    fn make_mapping(name: &str) -> Mapping {
+        Mapping {
+            name: name.to_string(),
+            namespace: format!("ns_{name}"),
+            source_schema: "public".to_string(),
+            source_table: "pages".to_string(),
+            id_column: "id".to_string(),
+            id_type: IdType::Uint,
+            columns: None,
+        }
+    }
+
+    fn insert_event(id: u64) -> RowEvent {
+        RowEvent {
+            relation_id: 1,
+            operation: Operation::Insert,
+            new_tuple: Some(Arc::new(TupleData {
+                columns: vec![ColumnValue::Text(Bytes::from(id.to_string()))],
+            })),
+            old_tuple: None,
+        }
+    }
+
+    fn multi_config_fixture(names: &[&str]) -> (RelationCache, Router, HashMap<String, String>, Vec<RowEvent>) {
+        let mut cache = RelationCache::new();
+        cache.insert(make_relation());
+        let mappings: Vec<_> = names.iter().map(|n| make_mapping(n)).collect();
+        let namespaces: HashMap<String, String> = mappings
+            .iter()
+            .map(|m| (m.name.clone(), m.namespace.clone()))
+            .collect();
+        let router = Router::new(mappings);
+        let events = (1..=5).map(insert_event).collect();
+        (cache, router, namespaces, events)
+    }
+
+    async fn connect_store_with_configs(names: &[&str]) -> Store {
+        let pg = SharedTestPg::get().await;
+        let (url, schema) = pg.fresh_schema();
+        let db = Store::connect(&url, &schema).await.unwrap();
+        for name in names {
+            db.insert_config(&ConfigRecord {
+                name: name.to_string(),
+                namespace: format!("ns_{name}"),
+                content_hash: "test".to_string(),
+                transform_hash: None,
+                applied_at: chrono::Utc::now(),
+                tombstone_applied_at: None,
+                namespace_prefix: None,
+            })
+            .await
+            .unwrap();
+        }
+        db
+    }
+
+    async fn run_process(
+        events: &[RowEvent],
+        cache: &RelationCache,
+        router: &Router,
+        transformers: &HashMap<String, Box<dyn Transformer>>,
+        namespaces: &HashMap<String, String>,
+        sink: &dyn BackfillSink,
+        db: &Store,
+        concurrency: usize,
+    ) -> HashMap<String, u64> {
+        let mut events_processed = HashMap::new();
+        let checkpoints = HashMap::new();
+        process_events(
+            events,
+            cache,
+            router,
+            transformers,
+            namespaces,
+            sink,
+            db,
+            None,
+            &mut events_processed,
+            100,
+            &checkpoints,
+            100,
+            concurrency,
+        )
+        .await
+        .unwrap();
+        events_processed
+    }
+
+    #[tokio::test]
+    async fn concurrent_configs_match_serial_action_sequences() {
+        let names = ["pages_a", "pages_b", "pages_c"];
+        let db = connect_store_with_configs(&names).await;
+        let (cache, router, namespaces, events) = multi_config_fixture(&names);
+        let transformers: HashMap<String, Box<dyn Transformer>> = names
+            .iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    Box::new(PassthroughTransformer::new(vec!["id".into()])) as Box<dyn Transformer>,
+                )
+            })
+            .collect();
+
+        let serial = CollectingSink::new();
+        run_process(
+            &events,
+            &cache,
+            &router,
+            &transformers,
+            &namespaces,
+            &serial,
+            &db,
+            1,
+        )
+        .await;
+
+        let concurrent = CollectingSink::new();
+        run_process(
+            &events,
+            &cache,
+            &router,
+            &transformers,
+            &namespaces,
+            &concurrent,
+            &db,
+            names.len(),
+        )
+        .await;
+
+        for name in names {
+            let ns = format!("ns_{name}");
+            assert_eq!(
+                serial.fingerprints_for(&ns),
+                concurrent.fingerprints_for(&ns),
+                "namespace {ns} action sequence must match serial vs concurrent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_transform_identical_under_concurrency() {
+        let names = ["page_chunks_a", "page_chunks_b"];
+        let db = connect_store_with_configs(&names).await;
+        let (cache, router, namespaces, events) = multi_config_fixture(&names);
+        let transformers: HashMap<String, Box<dyn Transformer>> = names
+            .iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    Box::new(FanoutTransformer { chunks: 3 }) as Box<dyn Transformer>,
+                )
+            })
+            .collect();
+
+        let serial = CollectingSink::new();
+        run_process(
+            &events,
+            &cache,
+            &router,
+            &transformers,
+            &namespaces,
+            &serial,
+            &db,
+            1,
+        )
+        .await;
+
+        let concurrent = CollectingSink::new();
+        run_process(
+            &events,
+            &cache,
+            &router,
+            &transformers,
+            &namespaces,
+            &concurrent,
+            &db,
+            names.len(),
+        )
+        .await;
+
+        for name in names {
+            let ns = format!("ns_{name}");
+            let serial_actions = serial.actions_for(&ns);
+            assert_eq!(serial_actions.len(), 5 * 3, "expected 3 chunks per event");
+            assert_eq!(
+                serial.fingerprints_for(&ns),
+                concurrent.fingerprints_for(&ns),
+                "fan-out sequence for {ns} must match serial vs concurrent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transform_failure_isolates_to_failing_config() {
+        let db = connect_store_with_configs(&["bad", "good"]).await;
+        let (cache, router, namespaces, events) = multi_config_fixture(&["bad", "good"]);
+        let mut transformers: HashMap<String, Box<dyn Transformer>> = HashMap::new();
+        transformers.insert("bad".into(), Box::new(FailingTransformer));
+        transformers.insert(
+            "good".into(),
+            Box::new(PassthroughTransformer::new(vec!["id".into()])),
+        );
+
+        let sink = CollectingSink::new();
+        let processed = run_process(
+            &events,
+            &cache,
+            &router,
+            &transformers,
+            &namespaces,
+            &sink,
+            &db,
+            2,
+        )
+        .await;
+
+        assert!(sink.actions_for("ns_bad").is_empty());
+        assert_eq!(sink.actions_for("ns_good").len(), 5);
+        assert_eq!(processed.get("good"), Some(&5));
+        assert!(!processed.contains_key("bad"));
+
+        let bad_dlq = db.list_dlq_entries(Some("bad"), 100).await.unwrap();
+        let good_dlq = db.list_dlq_entries(Some("good"), 100).await.unwrap();
+        assert_eq!(bad_dlq.len(), 5);
+        assert!(good_dlq.is_empty());
+    }
 }
+
