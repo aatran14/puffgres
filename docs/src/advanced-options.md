@@ -24,6 +24,7 @@ dlq_permanent_max_age_hours = 72
 # max_transaction_events = 1000000
 # sub_batch_size = 1000
 # transform_timeout_secs = 30
+# config_concurrency = 4
 # maintenance_interval_secs = 600
 # tls_unclean_close_level = "error"
 ```
@@ -73,6 +74,10 @@ When set, large transactions are streamed in sub-batches of this size instead of
 ### `transform_timeout_secs`
 
 How long puffgres waits for a single `transform.ts` batch response before killing and respawning the worker process. Default: **30** seconds.
+
+### `config_concurrency`
+
+Max number of configs to transform and send concurrently within one CDC batch. Each config still uses one transform subprocess and writes its own turbopuffer namespace in order, so fan-out (e.g. page to page_chunks) and id remapping keep working. Default: **1** (serial across configs). Raise this when many configs share a batch; it does not parallelize a single hot table.
 
 ### `maintenance_interval_secs`
 
